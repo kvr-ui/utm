@@ -70,8 +70,8 @@ if it fails, the Bigin insert still succeeds.
 See `.env.example`. Key vars:
 
 - `ZOHO_CLIENT_ID` / `ZOHO_CLIENT_SECRET` / `ZOHO_REFRESH_TOKEN` / `ZOHO_REGION`
-- `PORT` (default 8080)
-- `FRONTEND_DIST` — absolute path to the website's built `dist/` (for single-port serving)
+- `PORT` (default 7001)
+- `FRONTEND_DIST` — absolute path to the website's built `dist/` (for single-port serving). Leave **empty** for API-only deployments (Docker / separate frontend container)
 - `LEADS_API_URL` — external leads endpoint
 - `COUNSELING_RATE_MAX` / `COUNSELING_RATE_WINDOW_MS` — per-IP rate limit
 - `COUNSELING_TRUST_PROXY` — trust `X-Forwarded-For` (behind ngrok / reverse proxy)
@@ -79,19 +79,26 @@ See `.env.example`. Key vars:
 
 ## Running
 
-**Single port (site + API):**
+**API-only (frontend served separately — the default for Docker):**
+```bash
+# leave FRONTEND_DIST empty in .env, then:
+npm start
+# → API on http://localhost:7001
+```
+
+**Single port (this server also serves the site):**
 ```bash
 # 1) build the website
 cd /home/sandy/Downloads/FOCAS-Edu-Website-main && npm run build
-# 2) run this server (serves that dist + API on PORT)
+# 2) set FRONTEND_DIST to that dist/ in .env, then run this server
 cd /home/sandy/Downloads/focas-lead-server && npm start
-# → http://localhost:8080
+# → site + API on http://localhost:7001
 ```
 
 **Dev with hot-reload (API on :7001, website via `vite`):**
 ```bash
 cd /home/sandy/Downloads/focas-lead-server && npm run server:dev   # API :7001
-cd /home/sandy/Downloads/FOCAS-Edu-Website-main && npm run dev      # site :8080 (proxies /api → :7001)
+cd /home/sandy/Downloads/FOCAS-Edu-Website-main && npm run dev      # site (Vite) proxies /api → :7001
 ```
 
 ## Docker deploy (Hostinger VPS)
