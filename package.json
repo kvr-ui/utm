@@ -1,0 +1,15 @@
+{
+  "name": "focas-lead-server",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Bigin lead-capture server for the FOCAS Edu website (Contacts insert + UTM forward, single-port site serving).",
+  "scripts": {
+    "start": "node index.js",
+    "server": "node index.js",
+    "server:dev": "PORT=7001 node index.js"
+  },
+  "engines": {
+    "node": ">=18"
+  }
+}
