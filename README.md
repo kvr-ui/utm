@@ -94,6 +94,43 @@ cd /home/sandy/Downloads/focas-lead-server && npm run server:dev   # API :7001
 cd /home/sandy/Downloads/FOCAS-Edu-Website-main && npm run dev      # site :8080 (proxies /api → :7001)
 ```
 
+## Docker deploy (Hostinger VPS)
+
+The server runs in a Docker container on port **7001**. Secrets are passed at
+runtime via `--env-file .env` (never baked into the image).
+
+**First-time setup on the VPS:**
+```bash
+git clone <repo-url> focas-lead-server
+cd focas-lead-server
+cp .env.example .env      # then edit .env with real credentials + PORT=7001
+docker build -t focas-lead-server .
+docker run -d --name focas-lead-server \
+  -p 7001:7001 \
+  --env-file .env \
+  --restart unless-stopped \
+  focas-lead-server
+```
+
+**Pull the latest code and rebuild the container:**
+```bash
+cd focas-lead-server
+git pull                                  # get the new code
+docker build -t focas-lead-server .       # rebuild the image
+docker stop focas-lead-server             # stop the old container
+docker rm focas-lead-server               # remove it
+docker run -d --name focas-lead-server \  # start fresh from the new image
+  -p 7001:7001 \
+  --env-file .env \
+  --restart unless-stopped \
+  focas-lead-server
+docker logs -f focas-lead-server          # verify it started (Ctrl+C to exit)
+```
+
+> Tip: `git pull` never touches `.env` (it's git-ignored), so your credentials
+> survive rebuilds. If a rebuild pulls no code changes, Docker reuses cached
+> layers and the rebuild is near-instant.
+
 ## Notes
 
 - Needs **Node 18+** (built-in `fetch`). No `npm install` required.
