@@ -1,4 +1,19 @@
+# Dependencies
 node_modules/
+
+# Secrets — never commit real credentials (.env.example is safe to commit)
 .env
+.env.*
+!.env.example
+
+# Built frontend served via FRONTEND_DIST
+dist/
+
+# Logs
 *.log
+npm-debug.log*
+
+# Editor / OS
 .DS_Store
+.vscode/
+.idea/

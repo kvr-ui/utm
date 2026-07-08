@@ -103,6 +103,17 @@ async function getAccessToken() {
   return tokenCache.value;
 }
 
+// Today's date in Asia/Kolkata (IST) as "YYYY-MM-DD" for Bigin date fields.
+function todayIST() {
+  // en-CA formats as YYYY-MM-DD; the timeZone pins it to the Indian calendar day.
+  return new Intl.DateTimeFormat("en-CA", {
+    timeZone: "Asia/Kolkata",
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+  }).format(new Date());
+}
+
 // ── Build the Bigin Contact from the form payload ──
 // leadSource sets Lead_Source1 (e.g. "Student Registration", "Hindi WB").
 function buildContact(b, leadSource = "Student Registration") {
@@ -128,6 +139,9 @@ function buildContact(b, leadSource = "Student Registration") {
     Other_City: otherCity,
     Language: language,
     Lead_Source1: leadSource,
+    // Stamp today's date (IST) on every submission. On an upsert-update this
+    // refreshes the referral date of the existing contact to today.
+    Referral_date: todayIST(),
   };
   if (first) rec.First_Name = first;
   return rec;
@@ -175,22 +189,31 @@ async function forwardLead(body, biginId, source = "counseling-form") {
   }
 }
 
+// Upsert the Contact: if a Contact with the same Phone already exists, Bigin
+// updates it (merging the new field values) instead of failing with
+// DUPLICATE_DATA; otherwise it inserts a new one. `duplicate_check_fields`
+// tells Bigin which field(s) identify an existing record.
 async function insertContact(record) {
   const token = await getAccessToken();
-  const res = await fetch(`${API_HOST}/bigin/v2/Contacts`, {
+  const res = await fetch(`${API_HOST}/bigin/v2/Contacts/upsert`, {
     method: "POST",
     headers: {
       Authorization: `Zoho-oauthtoken ${token}`,
       "Content-Type": "application/json",
     },
-    body: JSON.stringify({ data: [record], trigger: ["workflow"] }),
+    body: JSON.stringify({
+      data: [record],
+      duplicate_check_fields: ["Phone"],
+      trigger: ["workflow"],
+    }),
   });
   const data = await res.json();
   const row = data?.data?.[0];
   if (row?.code !== "SUCCESS") {
     throw { status: 502, message: row?.message || "Bigin rejected the record", detail: data };
   }
-  return row.details?.id;
+  // row.action is "insert" or "update".
+  return { id: row.details?.id, action: row.action };
 }
 
 // ── Rate limiting (in-memory, per-IP sliding window) ──
@@ -343,8 +366,8 @@ const server = http.createServer((req, res) => {
         }
 
         const record = buildContact(body, cfg.leadSource);
-        const id = await insertContact(record);
-        console.log(`[leads] contact created: ${id} (${cfg.source})`);
+        const { id, action } = await insertContact(record);
+        console.log(`[leads] contact ${action}d: ${id} (${cfg.source})`);
         // Forward student details + UTMs to the leads API (best-effort).
         await forwardLead(body, id, cfg.source);
         sendJson(res, 200, { ok: true, id });
