@@ -14,11 +14,19 @@
 
 import http from "node:http";
 import { readFileSync, existsSync } from "node:fs";
-import { readFile } from "node:fs/promises";
+import { readFile, appendFile, writeFile } from "node:fs/promises";
 import { fileURLToPath } from "node:url";
 import { dirname, join, extname, normalize, resolve } from "node:path";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
+
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+// fetch with a timeout so a hung upstream (flaky tunnel, Zoho stall) never
+// leaves a client request pending forever.
+async function fetchWithTimeout(url, options = {}, timeoutMs = 8000) {
+  return fetch(url, { ...options, signal: AbortSignal.timeout(timeoutMs) });
+}
 
 // ── Load .env from this folder (simple parser; does not overwrite real env) ──
 function loadEnv() {
@@ -39,7 +47,7 @@ function loadEnv() {
 }
 loadEnv();
 
-const CLIENT_ID = process.env.ZOHO_CLIENT_ID || process.env.OHO_CLIENT_ID;
+const CLIENT_ID = process.env.ZOHO_CLIENT_ID;
 const CLIENT_SECRET = process.env.ZOHO_CLIENT_SECRET;
 const REFRESH_TOKEN = process.env.ZOHO_REFRESH_TOKEN;
 const REGION = (process.env.ZOHO_REGION || "in").toLowerCase();
@@ -51,6 +59,9 @@ const ALLOWED = (process.env.COUNSELING_ALLOWED_ORIGINS || "")
 // External leads API — receives the full student details + UTM params.
 // (UTMs are deliberately NOT written to Bigin.)
 const LEADS_API_URL = process.env.LEADS_API_URL || "";
+// Leads that fail to forward (CRM/tunnel down) are appended here and replayed
+// on startup, so downtime never silently drops a lead from the CRM.
+const DEAD_LETTER_FILE = join(__dirname, "failed-leads.jsonl");
 // Rate limit: max submissions per IP within the window (defaults: 5 / 10 min).
 const RATE_MAX = Number(process.env.COUNSELING_RATE_MAX || 5);
 const RATE_WINDOW_MS = Number(process.env.COUNSELING_RATE_WINDOW_MS || 10 * 60 * 1000);
@@ -76,31 +87,43 @@ if (!CLIENT_ID || !CLIENT_SECRET || !REFRESH_TOKEN) {
 
 // ── Access-token cache ──
 let tokenCache = { value: null, expiresAt: 0 };
+let tokenInFlight = null; // de-dupe concurrent refreshes
 
 async function getAccessToken() {
   if (tokenCache.value && Date.now() < tokenCache.expiresAt - 60_000) {
     return tokenCache.value;
   }
-  const body = new URLSearchParams({
-    refresh_token: REFRESH_TOKEN,
-    client_id: CLIENT_ID,
-    client_secret: CLIENT_SECRET,
-    grant_type: "refresh_token",
-  });
-  const res = await fetch(`${ACCOUNTS_HOST}/oauth/v2/token`, {
-    method: "POST",
-    headers: { "Content-Type": "application/x-www-form-urlencoded" },
-    body,
-  });
-  const data = await res.json();
-  if (!data.access_token) {
-    throw new Error("token refresh failed: " + JSON.stringify(data));
+  // If a refresh is already running, await it instead of hitting Zoho again.
+  if (tokenInFlight) return tokenInFlight;
+
+  tokenInFlight = (async () => {
+    const body = new URLSearchParams({
+      refresh_token: REFRESH_TOKEN,
+      client_id: CLIENT_ID,
+      client_secret: CLIENT_SECRET,
+      grant_type: "refresh_token",
+    });
+    const res = await fetchWithTimeout(`${ACCOUNTS_HOST}/oauth/v2/token`, {
+      method: "POST",
+      headers: { "Content-Type": "application/x-www-form-urlencoded" },
+      body,
+    });
+    const data = await res.json();
+    if (!data.access_token) {
+      throw new Error("token refresh failed: " + JSON.stringify(data));
+    }
+    tokenCache = {
+      value: data.access_token,
+      expiresAt: Date.now() + (data.expires_in || 3600) * 1000,
+    };
+    return tokenCache.value;
+  })();
+
+  try {
+    return await tokenInFlight;
+  } finally {
+    tokenInFlight = null;
   }
-  tokenCache = {
-    value: data.access_token,
-    expiresAt: Date.now() + (data.expires_in || 3600) * 1000,
-  };
-  return tokenCache.value;
 }
 
 // Today's date in Asia/Kolkata (IST) as "YYYY-MM-DD" for Bigin date fields.
@@ -147,8 +170,24 @@ function buildContact(b, leadSource = "Student Registration") {
   return rec;
 }
 
+// POST one payload to the leads API. Throws on network error / non-2xx.
+async function postToLeadsApi(payload) {
+  const res = await fetchWithTimeout(LEADS_API_URL, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      // Skip ngrok's browser-warning interstitial for API calls.
+      "ngrok-skip-browser-warning": "true",
+    },
+    body: JSON.stringify(payload),
+  });
+  if (!res.ok) throw new Error(`leads API responded ${res.status}`);
+  return res.status;
+}
+
 // Forward the full lead (student details + UTMs) to the external leads API.
-// Best-effort: never blocks or fails the Bigin insert.
+// Retries a few times, then dead-letters to disk so nothing is lost while the
+// CRM/tunnel is down. Never throws — a forward failure must not fail the request.
 async function forwardLead(body, biginId, source = "counseling-form") {
   if (!LEADS_API_URL) return;
   const u = body.utm || {};
@@ -173,19 +212,70 @@ async function forwardLead(body, biginId, source = "counseling-form") {
     biginContactId: biginId || "",
     source,
   };
+
+  const attempts = 3;
+  let delayMs = 500;
+  for (let i = 0; i < attempts; i++) {
+    try {
+      const status = await postToLeadsApi(payload);
+      console.log(`[leads] leads API forward → ${status}`);
+      return;
+    } catch (err) {
+      console.error(`[leads] forward attempt ${i + 1}/${attempts} failed:`, err?.message || err);
+      if (i < attempts - 1) {
+        await sleep(delayMs);
+        delayMs *= 2;
+      }
+    }
+  }
+
+  // All retries failed — persist for replay on the next startup.
   try {
-    const res = await fetch(LEADS_API_URL, {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        // Skip ngrok's browser-warning interstitial for API calls.
-        "ngrok-skip-browser-warning": "true",
-      },
-      body: JSON.stringify(payload),
-    });
-    console.log(`[leads] leads API forward → ${res.status}`);
-  } catch (err) {
-    console.error("[leads] leads API forward failed:", err?.message || err);
+    await appendFile(
+      DEAD_LETTER_FILE,
+      JSON.stringify({ at: new Date().toISOString(), payload }) + "\n",
+    );
+    console.warn(`[leads] forward failed after ${attempts} attempts; dead-lettered.`);
+  } catch (e) {
+    console.error("[leads] could not write dead-letter file:", e?.message || e);
+  }
+}
+
+// On startup, replay any dead-lettered leads and rewrite the file with whatever
+// still fails, so a recovered CRM/tunnel backfills leads missed during downtime.
+async function replayDeadLetters() {
+  if (!LEADS_API_URL) return;
+  let raw;
+  try {
+    raw = await readFile(DEAD_LETTER_FILE, "utf8");
+  } catch {
+    return; // no file → nothing to replay
+  }
+  const lines = raw.split("\n").filter((l) => l.trim());
+  if (!lines.length) return;
+
+  console.log(`[leads] replaying ${lines.length} dead-lettered lead(s)...`);
+  const stillFailed = [];
+  for (const line of lines) {
+    let entry;
+    try {
+      entry = JSON.parse(line);
+    } catch {
+      continue; // drop corrupt line
+    }
+    try {
+      await postToLeadsApi(entry.payload);
+    } catch {
+      stillFailed.push(line);
+    }
+  }
+  try {
+    await writeFile(DEAD_LETTER_FILE, stillFailed.length ? stillFailed.join("\n") + "\n" : "");
+    console.log(
+      `[leads] replay done; ${lines.length - stillFailed.length} recovered, ${stillFailed.length} pending.`,
+    );
+  } catch (e) {
+    console.error("[leads] could not rewrite dead-letter file:", e?.message || e);
   }
 }
 
@@ -195,7 +285,7 @@ async function forwardLead(body, biginId, source = "counseling-form") {
 // tells Bigin which field(s) identify an existing record.
 async function insertContact(record) {
   const token = await getAccessToken();
-  const res = await fetch(`${API_HOST}/bigin/v2/Contacts/upsert`, {
+  const res = await fetchWithTimeout(`${API_HOST}/bigin/v2/Contacts/upsert`, {
     method: "POST",
     headers: {
       Authorization: `Zoho-oauthtoken ${token}`,
@@ -222,7 +312,15 @@ const rateHits = new Map(); // ip -> number[] of request timestamps
 function clientIp(req) {
   if (TRUST_PROXY) {
     const xff = req.headers["x-forwarded-for"];
-    if (xff) return String(xff).split(",")[0].trim();
+    if (xff) {
+      const parts = String(xff)
+        .split(",")
+        .map((s) => s.trim())
+        .filter(Boolean);
+      // Use the LAST hop — the value our trusted proxy appended — not the first,
+      // which is client-supplied and trivially spoofed to dodge the rate limit.
+      if (parts.length) return parts[parts.length - 1];
+    }
   }
   return req.socket?.remoteAddress || "unknown";
 }
@@ -253,10 +351,11 @@ setInterval(() => {
 // ── CORS ──
 function applyCors(req, res) {
   const origin = req.headers.origin;
-  if (origin && (ALLOWED.length === 0 || ALLOWED.includes(origin))) {
+  // Only reflect an allow-listed origin (or "*" if the operator explicitly opts
+  // in). Unset COUNSELING_ALLOWED_ORIGINS = same-origin only — no wildcard by
+  // default — which is correct for the single-port setup (site + API together).
+  if (origin && (ALLOWED.includes("*") || ALLOWED.includes(origin))) {
     res.setHeader("Access-Control-Allow-Origin", origin);
-  } else if (ALLOWED.length === 0) {
-    res.setHeader("Access-Control-Allow-Origin", "*");
   }
   res.setHeader("Vary", "Origin");
   res.setHeader("Access-Control-Allow-Methods", "POST, OPTIONS");
@@ -336,6 +435,7 @@ const server = http.createServer((req, res) => {
   const FORMS = {
     "/api/counseling": { leadSource: "Student Registration", source: "counseling-form" },
     "/api/workout-batch": { leadSource: "Hindi WB", source: "workout-batch" },
+    "/api/foundation-school": { leadSource: "Foundation School", source: "foundation-school" },
   };
 
   if (req.method === "POST" && FORMS[req.url]) {
@@ -365,12 +465,32 @@ const server = http.createServer((req, res) => {
           return sendJson(res, 200, { ok: true });
         }
 
+        // Validates input (throws 400 for e.g. missing last name) before any I/O.
         const record = buildContact(body, cfg.leadSource);
-        const { id, action } = await insertContact(record);
-        console.log(`[leads] contact ${action}d: ${id} (${cfg.source})`);
-        // Forward student details + UTMs to the leads API (best-effort).
-        await forwardLead(body, id, cfg.source);
-        sendJson(res, 200, { ok: true, id });
+
+        // Insert into Bigin, but a Bigin outage must NOT block the CRM forward —
+        // the two sinks are independent. Capture the failure and keep going.
+        let biginId = null;
+        let biginError = null;
+        try {
+          const r = await insertContact(record);
+          biginId = r.id;
+          console.log(`[leads] contact ${r.action}d: ${r.id} (${cfg.source})`);
+        } catch (err) {
+          biginError = err;
+          console.error("[leads] Bigin insert failed:", err?.message || err, err?.detail || "");
+        }
+
+        // Always forward student details + UTMs to the leads API (self-retrying,
+        // dead-letters on persistent failure). Runs even if Bigin failed.
+        await forwardLead(body, biginId, cfg.source);
+
+        if (biginError) {
+          const status = biginError?.status || 502;
+          sendJson(res, status, { ok: false, error: biginError?.message || "Bigin error" });
+          return;
+        }
+        sendJson(res, 200, { ok: true, id: biginId });
       } catch (err) {
         const status = err?.status || 500;
         console.error("[leads] error:", err?.message || err, err?.detail || "");
@@ -393,4 +513,6 @@ server.listen(PORT, () => {
   if (!existsSync(DIST_DIR)) {
     console.warn("[leads] FRONTEND_DIST not found — build the website and set FRONTEND_DIST.");
   }
+  // Backfill any leads that failed to forward while the CRM/tunnel was down.
+  void replayDeadLetters();
 });

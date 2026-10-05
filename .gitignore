@@ -17,3 +17,6 @@ npm-debug.log*
 .DS_Store
 .vscode/
 .idea/
+
+# Dead-letter queue for leads that failed to forward
+failed-leads.jsonl
