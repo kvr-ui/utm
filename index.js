@@ -61,7 +61,8 @@ const ALLOWED = (process.env.COUNSELING_ALLOWED_ORIGINS || "")
 const LEADS_API_URL = process.env.LEADS_API_URL || "";
 // Leads that fail to forward (CRM/tunnel down) are appended here and replayed
 // on startup, so downtime never silently drops a lead from the CRM.
-const DEAD_LETTER_FILE = join(__dirname, "failed-leads.jsonl");
+const DEAD_LETTER_FILE =
+  process.env.DEAD_LETTER_FILE || join(__dirname, "failed-leads.jsonl");
 // Rate limit: max submissions per IP within the window (defaults: 5 / 10 min).
 const RATE_MAX = Number(process.env.COUNSELING_RATE_MAX || 5);
 const RATE_WINDOW_MS = Number(process.env.COUNSELING_RATE_WINDOW_MS || 10 * 60 * 1000);

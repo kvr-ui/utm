@@ -16,6 +16,12 @@ RUN npm ci --omit=dev || npm install --omit=dev
 # App source.
 COPY . .
 
+# Failed lead forwards are queued here for replay on the next start. The app
+# runs as `node`, which can't write to /app, so give it its own directory
+# (mount a volume here to keep the queue across redeploys).
+ENV DEAD_LETTER_FILE=/app/data/failed-leads.jsonl
+RUN mkdir -p /app/data && chown node:node /app/data
+
 # Drop privileges — `node` user exists in the official image.
 USER node
 
