@@ -139,7 +139,7 @@ function todayIST() {
 }
 
 // ── Build the Bigin Contact from the form payload ──
-// leadSource sets Lead_Source1 (e.g. "Student Registration", "Hindi WB").
+// leadSource sets Lead_Source1 (e.g. "Student Registration", "Mentor Session").
 function buildContact(b, leadSource = "Student Registration") {
   const first = String(b.firstName || "").trim();
   const last = String(b.lastName || "").trim();
@@ -435,7 +435,7 @@ const server = http.createServer((req, res) => {
   // Source written to Bigin and the "source" tag sent to the leads API.
   const FORMS = {
     "/api/counseling": { leadSource: "Student Registration", source: "counseling-form" },
-    "/api/workout-batch": { leadSource: "Hindi WB", source: "workout-batch" },
+    "/api/workout-batch": { leadSource: "Mentor Session", source: "workout-batch" },
     "/api/foundation-school": { leadSource: "Foundation School", source: "foundation-school" },
   };
 
