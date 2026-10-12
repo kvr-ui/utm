@@ -57,7 +57,7 @@ UTM params are **never** written to Bigin — they only go to the leads API.
 | Endpoint | `Lead_Source1` (Bigin) | `source` (leads API) |
 |----------|------------------------|----------------------|
 | `/api/counseling` | `Student Registration` | `counseling-form` |
-| `/api/workout-batch` | `Mentor Session` | `workout-batch` |
+| `/api/workout-batch` | `workout-batch` | `workout-batch` |
 
 ## Leads API forward
 
